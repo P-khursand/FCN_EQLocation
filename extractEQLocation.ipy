@@ -1,0 +1,51 @@
+from settings import  REGION, LATITUDE_DELTA, LONGITUDE_DELTA, DEPTH_DELTA
+import glob
+import os
+import numpy as np
+import tifffile
+from read_data import read_catalog
+
+base_folder = "E:/FCN_FOLDER/پایان/RESULTS_FCN"
+# earthquakes = read_catalog(catalog_file)
+# print(len(earthquakes))
+# image path folder
+labels = glob.glob(os.path.join(base_folder,"l*.tiff"))
+outputs = glob.glob(os.path.join(base_folder,"o*.tiff"))
+#region coordinate
+region = REGION
+longitude_delta = LONGITUDE_DELTA
+latitude_delta = LATITUDE_DELTA
+depth_delta = DEPTH_DELTA
+
+x_samples = int((region[1] - region[0]) / longitude_delta)
+y_samples = int((region[3] - region[2]) / latitude_delta)
+z_samples = int((region[5] - region[4]) / depth_delta)
+
+x = np.linspace(region[0], region[1], x_samples)
+y = np.linspace(region[2], region[3], y_samples)
+z = np.linspace(region[4], region[5], z_samples)
+
+delta_x = x[1] - x[0]
+delta_y = y[1] - y[0]
+delta_z = z[1] - z[0]
+h_error = []
+z_error =[]
+fid = open("results.txt", "w")
+#extract loop for earthquake location
+for i in range(len(labels)):
+    label = tifffile.imread(labels[i])
+    name = labels[i].split("\\")[-1]
+    output = tifffile.imread(outputs[i])
+    zl, lonl, latl = np.unravel_index(label.argmax(), label.shape)
+    zo, lono, lato = np.unravel_index(output.argmax(), output.shape)
+    h_err = np.sqrt(((lonl-lono)*delta_x)**2+((latl-lato)*delta_y)**2)*110
+    z_err = np.abs(zl-zo)*delta_z
+    h_error.append(h_err)
+    z_error.append(z_err)
+    fid.write(f"{name} {i} {lonl} {latl} {zl} {lono} {lato} {zo} {region[0]+lonl*delta_x} {region[2]+latl*delta_y} "
+              f"{zl*delta_z} {region[0]+lono*delta_x} {region[2]+lato*delta_y} {zo*delta_z} {h_err} {z_err}\n")
+
+print(np.mean(h_error), np.std(h_error))
+print(np.mean(z_error), np.std(z_error))
+
+fid.close()

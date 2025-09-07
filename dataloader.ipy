@@ -1,0 +1,154 @@
+import numpy as np
+import pandas as pd
+from obspy import read, UTCDateTime
+import os
+import matplotlib.pylab as plt
+
+#data loader
+def read_station(file):
+    return pd.read_csv(file)
+
+
+def read_catalog(file):
+    return pd.read_csv(file)
+
+
+def folder_name(eq_dataset, index):
+    if index < 0 or index > len(eq_dataset):
+        print(f"the id should be in range of 0 to {len(eq_dataset)}")
+        return -1
+    else:
+        year = eq_dataset["year"][index]
+        month = eq_dataset["month"][index]
+        day = eq_dataset["day"][index]
+        hour = eq_dataset["hour"][index]
+        minute = eq_dataset["minute"][index]
+        second = eq_dataset["second"][index]
+        return os.path.join(f"{year:04d}",f"{year:04d}{month:02d}",
+                            f"P{year:04d}{month:02d}{day:02d}.{hour:02d}{minute:02d}{second:05.2f}")
+
+
+def read_seismogram(eq_dataset, index, base_folder):
+    if index < 0 or index > len(eq_dataset):
+        print(f"the id should be in range of 0 to {len(eq_dataset)}")
+        return -1
+    else:
+        folder = folder_name(eq_dataset, index)
+        starttime = UTCDateTime(eq_dataset["year"][index],
+                                eq_dataset["month"][index],
+                                eq_dataset["day"][index],
+                                eq_dataset["hour"][index],
+                                eq_dataset["minute"][index],
+                                eq_dataset["second"][index])
+        data_mask = os.path.join(base_folder, folder, "*.mseed")
+        st = read(data_mask, starttime=starttime)
+        return st , starttime
+
+
+def process_data(stream, start_time, duration, original_sampling):
+    for trace in stream:
+        trace.stats.sampling_rate = original_sampling
+    end_time = start_time + duration
+    stream.detrend(type='linear')
+    stream.taper(type='cosine', max_percentage=0.01)
+    stream.merge(method=0, fill_value=0)
+    stream.trim(starttime=start_time, endtime=end_time, pad=True, fill_value=0.0)
+    for trace in stream:
+        trace.stats.starttime = start_time
+    return stream
+
+
+def make_image(stream, stations_data, duration, original_sampling):
+    stations = stations_data["Station"].values
+    # print(stations)
+
+    E = np.zeros((len(stations_data), duration * original_sampling + 1))
+    N = np.zeros((len(stations_data), duration * original_sampling + 1))
+    Z = np.zeros((len(stations_data), duration * original_sampling + 1))
+
+    for i in range(len(stations)):
+        tmp_stream = stream.select(station=stations[i])
+        for tr in tmp_stream:
+            # print(tr.stats.channel[-1])
+            if tr.stats.channel[-1] == "E" or tr.stats.channel == "e":
+                E[i, :] = tr.data[:]
+            elif tr.stats.channel[-1] == "N" or tr.stats.channel == "n":
+                N[i, :] = tr.data[:]
+            elif tr.stats.channel[-1] == "Z" or tr.stats.channel == "z":
+                Z[i, :] = tr.data[:]
+    img = np.array([E[:, :-1], N[:, :-1], Z[:, :-1]])
+    return img
+
+
+def normalize_image(img):
+    for i in range(img.shape[0]):
+        for j in range(img.shape[1]):
+            max_w = np.max(np.abs(img[i, j, :])) + 1e-7
+            img[i, j, :] = (img[i, j, :] / max_w + 1) / 2
+    return img
+
+
+def location_image(region, earthquake_data, index, longitude_delta, latitude_delta, depth_delta):
+    longitude = earthquake_data["longitude"].values[index]
+    latitude = earthquake_data["latitude"].values[index]
+    depth = earthquake_data["depth"].values[index]
+    horizontal_error = earthquake_data["error_loc"].values[index]*2
+    # print(horizontal_error)
+    depth_error = earthquake_data["uncertaint"].values[index]*10
+    # print(depth_error1)
+    # horizontal_error = 10
+    # depth_error = 5
+    if region[0] <= longitude <= region[1] and region[2] <= latitude <= region[3] and region[4] <= depth <= region[5]:
+        x_samples = int((region[1] - region[0]) / longitude_delta)
+        y_samples = int((region[3] - region[2]) / latitude_delta)
+        z_samples = int((region[5] - region[4]) / depth_delta)
+
+        x = np.linspace(region[0], region[1], x_samples)
+        y = np.linspace(region[2], region[3], y_samples)
+        z = np.linspace(region[4], region[5], z_samples)
+
+        xx, yy, zz = np.meshgrid(x, y, z, indexing="ij")
+        # print(longitude, latitude, depth, horizontal_error, type(depth_error))
+        # print(xx.shape, yy.shape, zz.shape)
+        loca_image = np.exp(-(
+                (xx - longitude) ** 2 / (horizontal_error / 110) +
+                (yy - latitude) ** 2 / (horizontal_error / 110) +
+                (zz - depth) ** 2 / depth_error))
+        return loca_image
+    else:
+        print(f"The earthquake id = {id} is not in the region")
+        return 1
+
+#catalog path folder
+if __name__ == "__main__":
+    station_file = "D:\parwiz/Station.csv"
+    catalog_file = "D:\parwiz/Catalog6.csv"
+
+    base_folder =  "D:/parwiz/"
+
+    stations = read_station(station_file)
+    earthquakes = read_catalog(catalog_file)
+
+    print(len(earthquakes))
+    
+# read earthquake data 
+    st , start_time= read_seismogram(earthquakes, 1, base_folder)
+    st = process_data(st, start_time, 120,50)
+    # print("--------------------------->",start_time)
+    # for tr in st:
+    #     print(tr.stats.starttime, tr.stats.npts, tr.stats.channel)
+   
+#wave form convert to image    
+    image = make_image(st, stations, 120, 50)
+    image = normalize_image(image)
+    print(image.shape,np.max(image), np.min(image))
+    print(image[1,:,:].shape)
+    #plt.figure(figsize=[6,8])
+    plt.imshow(100**image[1,:,:],  aspect='auto', cmap="hot")
+    plt.colorbar()
+    plt.show()
+
+
+    loc_image = location_image([45, 47, 33, 36, 0, 30], earthquakes, 1, 0.02, 0.02, 1.0)
+    print(loc_image.shape)
+

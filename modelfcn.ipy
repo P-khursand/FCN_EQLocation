@@ -1,0 +1,392 @@
+import os
+
+import tifffile
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+
+
+def calculate_correlation_accuracy(x, y, threshold=0.1, eps=1e-8):
+    """
+    Calculates the correlation coefficient for each tensor in the batch and accuracy.
+
+    Args:
+        x: A tensor of shape (N, C, H, W).
+        y: A tensor of shape (N, C, H, W).
+        threshold: Threshold for determining correct estimations (default is 0.1).
+        eps: Small value to prevent division by zero and handle floating-point precision.
+
+    Returns:
+        correlations: A tensor of shape (N) containing the correlation coefficient for each image in the batch.
+        accuracy: An integer representing the number of correct estimations based on the threshold.
+    """
+    N = x.shape[0]
+    x_flat = x.view(N, -1)
+    y_flat = y.view(N, -1)
+    # Flatten tensors to (N, -1) for simplicity
+
+    # Compute means
+    x_mean = x_flat.mean(dim=1, keepdim=True)
+    y_mean = y_flat.mean(dim=1, keepdim=True)
+
+    # Compute deviations
+    x_dev = x_flat - x_mean
+    y_dev = y_flat - y_mean
+
+    # Compute variances
+    x_var = (x_dev ** 2).sum(dim=1)
+    y_var = (y_dev ** 2).sum(dim=1)
+
+    # Compute covariance
+    covariance = (x_dev * y_dev).sum(dim=1)
+
+    # Initialize correlations tensor
+    correlations = torch.empty(N)
+
+    # Identify zero variance cases
+    zero_var_mask = (x_var.abs() < eps) & (y_var.abs() < eps)
+    non_zero_var_mask = ~zero_var_mask
+
+    # Handle zero variance cases
+    if zero_var_mask.any():
+        # Compute scaling factor k
+        x_mean_nonzero = x_mean[zero_var_mask].abs() > eps
+        y_mean_nonzero = y_mean[zero_var_mask].abs() > eps
+        both_nonzero = x_mean_nonzero & y_mean_nonzero
+        both_zero = ~x_mean_nonzero & ~y_mean_nonzero
+
+        # Handle cases where both means are non-zero (proportional relationship)
+        correlations[zero_var_mask] = torch.where(
+            both_nonzero.squeeze(),
+            torch.tensor(1.0),
+            torch.tensor(float('nan'))
+        )
+
+        # Handle cases where both means are zero (identical constants)
+        correlations[zero_var_mask] = torch.where(
+            both_zero.squeeze(),
+            torch.tensor(1.0),
+            correlations[zero_var_mask]
+        )
+
+        # For cases where one mean is zero and the other is not, correlation is undefined
+        correlations[zero_var_mask] = torch.where(
+            ~both_nonzero.squeeze() & ~both_zero.squeeze(),
+            torch.tensor(float('nan')),
+            correlations[zero_var_mask]
+        )
+
+    # Compute correlations for non-zero variance cases
+    correlations[non_zero_var_mask] = covariance[non_zero_var_mask] / (
+            torch.sqrt(x_var[non_zero_var_mask] * y_var[non_zero_var_mask]) + eps
+    )
+
+    # Compute accuracy (exclude NaN values)
+    valid_correlations = correlations[~correlations.isnan()]
+    accuracy = (valid_correlations >= threshold).sum().item()
+
+    return correlations, accuracy
+
+
+# Data Generator
+def generate_data(base_folder, index):
+    image_name = f"f{index:04d}.tiff"
+    label_name = f"l{index:04d}.tiff"
+    image_path = os.path.join(base_folder, "data", "images", image_name)
+    label_path = os.path.join(base_folder, "data", "labels", label_name)
+    image = tifffile.imread(image_path)
+    # print(f"image-{image_name} - Shape: {image.shape}")
+    label = tifffile.imread(label_path)
+    # print(f"label-{label_name} - Shape: {label.shape}")
+    return image, label
+
+
+
+
+class EarthquakeDataset(Dataset):
+    def __init__(self, base_folder, indices):
+        self.base_folder = base_folder
+        self.indices = indices
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, index):
+        idd = self.indices[index]
+        x, y = generate_data(self.base_folder, idd)
+        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
+# data split to train, validation , test
+def get_indices(earthquakes, split='train'):
+    total_len = len(earthquakes)
+    indices = np.arange(len(earthquakes))
+    total_len = len(earthquakes)
+    np.random.seed(42)
+    np.random.shuffle(indices)
+    if split == "train":
+        return indices[:int(0.7 * total_len)]
+    elif split == "validation":
+        return indices[int(0.7 * total_len): int(0.9 * total_len)]
+    elif split == "test":
+        return indices[int(0.9 * total_len): total_len]
+
+
+# Settings and Data Loading
+from settings import BASE_FOLDR, CATALOG, BATCH_SIZE
+from read_data import read_catalog
+
+catalog_file = CATALOG
+base_folder = BASE_FOLDR
+
+earthquakes = read_catalog(catalog_file)
+print(len(earthquakes))
+
+train_indices = get_indices(earthquakes, "train")
+val_indices = get_indices(earthquakes, "validation")
+test_indices = get_indices(earthquakes, "test")
+
+train_dataset = EarthquakeDataset(base_folder, train_indices)
+val_dataset = EarthquakeDataset(base_folder, val_indices)
+test_dataset = EarthquakeDataset(base_folder, test_indices)
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+
+# kk = 0
+# for x_val, y_val in train_loader:
+#     kk += 1
+#     print(kk, x_val.size(), y_val.size())
+
+# Model Definition
+class FCNloca(nn.Module):
+    def __init__(self):
+        super(FCNloca, self).__init__()
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=(1, 4))
+        )
+
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=(1, 4))
+        )
+
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=(2, 4))
+        )
+
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+
+            nn.MaxPool2d(kernel_size=(3, 4))
+        )
+
+        self.conv5 = nn.Sequential(
+            nn.Conv2d(512, 1024, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(1024, 1024, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+
+        self.up6 = nn.Sequential(
+            nn.Conv2d(1024, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=(25, 1), mode='bilinear', align_corners=True),
+        )
+
+        self.conv6 = nn.Sequential(
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+
+        self.up7 = nn.Sequential(
+            nn.Conv2d(512, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=(2, 2), mode='bilinear', align_corners=True),
+        )
+
+        self.conv7 = nn.Sequential(
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+
+        self.up8 = nn.Sequential(
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=(2, 2), mode='bilinear', align_corners=True),
+        )
+
+        self.conv8 = nn.Sequential(
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+        )
+
+        self.conv9 = nn.Sequential(
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.MaxPool2d(kernel_size=(2, 2))
+        )
+
+        self.up9 = nn.Sequential(
+            nn.Upsample(scale_factor=(1, 126), mode='bilinear', align_corners=True),
+            nn.MaxPool2d(kernel_size=(1, 39))
+        )
+
+        self.conv10 = nn.Sequential(
+            nn.Conv2d(32, 30,  kernel_size=3, padding=(1,2)),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # print("----->0",x.shape)
+        x = self.conv1(x)
+        # print("----->1",x.shape)
+        x = self.conv2(x)
+        # print("----->2",x.shape)
+        x = self.conv3(x)
+        # print("---->3",x.shape)
+        x = self.conv4(x)
+        # print("----->4",x.shape)
+        x = self.conv5(x)
+        # print("----->5",x.shape)
+        x = self.up6(x)
+        # print("----->6_0",x.shape)
+        x = self.conv6(x)
+        # print("----->6_1",x.shape)
+        x = self.up7(x)
+        x = self.conv7(x)
+        # print("----->7",x.shape)
+        x = self.up8(x)
+        x = self.conv8(x)
+        # print("----->8",x.shape)
+        x = self.conv9(x)
+        x = self.up9(x)
+        # print("----->9",x.shape)
+        x = self.conv10(x)
+        # print("----->10",x.shape)
+        return x
+
+def train_model(train_loader, val_loader, test_loader):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = FCNloca().to(device)
+    criterion = nn.BCELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.000001)
+    if not os.path.exists("model"):
+        os.mkdir("model")
+    PATH = os.path.join(os.getcwd(), "model", "model")
+
+    num_epochs = 50
+    acc_train = 0
+    acc_val = 0
+
+    fid = open("output.txt", "w")
+
+    # scheduler = ReduceLROnPlateau(optimizer, 'min', patience=10)
+    for epoch in range(num_epochs):
+        print(epoch)
+        model.train()
+        running_loss = 0.0
+        batch_n = 0
+        for x_batch, y_batch in train_loader:
+            batch_n += 1
+            # print("---------------------------->",x_batch.shape, y_batch.shape)
+            print(f'{epoch = }, {batch_n = }')
+            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+            optimizer.zero_grad()
+
+            outputs = model(x_batch)
+            # print("----------------->",outputs)
+            loss = criterion(outputs, y_batch)
+            loss.backward()
+            optimizer.step()
+            y_batch_cpu = y_batch.to("cpu")
+            outputs_cpu = outputs.to("cpu")
+
+            running_loss += loss.item()
+
+            _, tmp_acc = calculate_correlation_accuracy(y_batch_cpu, outputs_cpu, threshold=0.67, eps=1e-8)
+            acc_train += tmp_acc
+
+        fid.write(
+            f"Epoch {epoch + 1}/{num_epochs}, Loss: {running_loss / len(train_loader)}, Accuracy: {acc_train / len(train_loader)} ")
+        print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {running_loss / len(train_loader)}")
+
+        # Save model at predefined Path
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': loss
+        }, PATH)
+
+        # Validation Loop
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for x_val, y_val in val_loader:
+                x_val, y_val = x_val.to(device), y_val.to(device)
+
+                outputs = model(x_val)
+                loss = criterion(outputs, y_val)
+                val_loss += loss.item()
+                # scheduler.step(val_loss)
+                y_val_cpu = y_val.to("cpu")
+                outputs_cpu = outputs.to("cpu")
+                _, tmp_acc = calculate_correlation_accuracy(y_val_cpu, outputs_cpu, threshold=0.67, eps=1e-8)
+                acc_val += tmp_acc
+
+        fid.write(
+            f", Validation Loss: {val_loss / len(val_loader)}, Validation Accuracy: {acc_val / len(val_loader)}\n")
+        print(f"Epoch {epoch + 1}/{num_epochs}, Validation Loss: {val_loss / len(val_loader)}")
+    fid.close()
+
+    # After all epochs, perform a test loop
+    # After all epochs, perform a test loop
+    fid = open("test_output.txt", "w")
+    model.eval()
+    test_loss = 0.0
+    acc_test = 0
+    with torch.no_grad():
+        for x_test, y_test in test_loader:
+            x_test, y_test = x_test.to(device), y_test.to(device)
+
+            outputs = model(x_test)
+            loss = criterion(outputs, y_test)
+            test_loss += loss.item()
+            y_test_cpu = y_test.to("cpu")
+            outputs_cpu = outputs.to("cpu")
+
+            _, tmp_acc = calculate_correlation_accuracy(y_test_cpu, outputs_cpu, threshold=0.67, eps=1e-8)
+            acc_test += tmp_acc
+
+    fid.write(f"Test Loss: {test_loss / len(test_loader)}, Test Validation: {acc_test / len(test_loader)}\n")
+    print(f"Test Loss: {test_loss / len(test_loader)}")
+
+
+if __name__ == '__main__':
+    train_model(train_loader, val_loader, test_loader)
